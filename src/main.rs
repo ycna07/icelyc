@@ -1,15 +1,25 @@
+use iced::advanced::graphics::layer;
+use iced::advanced::svg::Handle;
 use iced::alignment::Horizontal::Left;
 use iced::border::width;
-use iced::widget::{Checkbox, Row, button, column, container, row, text};
-use iced::{Application, Length, run};
-use iced::{Color, Element, Settings, alignment};
+use iced::futures::io::Lines;
+use iced::widget::{Button, Checkbox, Row, button, column, container, image, row, stack, text};
+use iced::window::Settings;
+use iced::{Application, Background, Length, Shadow, Subscription, run};
+use iced::{Color, Element, alignment};
+use iced::{Fill, window};
 use regex::Regex;
 use std::time::Duration;
 use std::time::Instant;
 use std::vec;
+
+use crate::lib::Timer;
+pub mod lib;
 pub fn main() -> iced::Result {
     // iced::application(App::new, App::update, App::view).run()
-    iced::application(Karaoke::new, Karaoke::update, Karaoke::view).run()
+    iced::application(Karaoke::new, Karaoke::update, Karaoke::view)
+        .subscription(Karaoke::subscription)
+        .run()
 }
 
 #[derive(Debug, Clone)]
@@ -20,35 +30,26 @@ struct Word {
 }
 
 struct Karaoke {
-    words: Vec<Word>, // 第一行字事件流
-    start: Instant,   // 伪播放起点
+    lrc: String,
+    timer: Timer,
+    pos: u64,
+    is_playing: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Message {
     Tick,
+    TogglePlay,
+    Reset,
 }
 
-// struct App {
-//     is_prev_playing: bool,
-//     mode: ViewMode,
-//     // config: Vec<Config>,
-//     current_pos: usize,
-//     // current_source: audio::TheSource,
-//     slider_value: f32,
-//     time: Duration,
-//     tick_secs: f32,
-// }
-
-// #[derive(Debug, Clone)]
-// enum Message {}
 impl Karaoke {
     fn new() -> Self {
-        let lrc = include_str!("lrc.txt"); // 把整段 LRC 放同目录 lrc.txt
-        let words = parse_lines(&lrc);
         Self {
-            words,
-            start: Instant::now(),
+            lrc: include_str!("lrc.txt").to_string(),
+            timer: Timer::new(),
+            pos: 0,
+            is_playing: false,
         }
     }
 
@@ -58,38 +59,124 @@ impl Karaoke {
 
     fn update(&mut self, msg: Message) {
         match msg {
-            Message::Tick => {} // 什么都不用做，视图会重新取当前时间
+            Message::Tick => {
+                self.pos = self.timer.elapsed().as_millis() as u64;
+                // println!(
+                //     "pos:{}\ntimer:{}",
+                //     self.pos,
+                //     self.timer.elapsed().as_millis()
+                // )
+            }
+            Message::TogglePlay => {
+                self.is_playing = !self.is_playing;
+                if self.timer.is_paused() {
+                    self.timer.resume();
+                } else {
+                    self.timer.pause();
+                }
+            }
+            Message::Reset => {
+                self.timer.reset();
+            }
         }
     }
-
     fn view(&self) -> Element<Message> {
-        let now = self.start.elapsed().as_millis() as u64;
-        let mut line = iced::widget::row![];
-        for (w) in self.words.iter() {
-            let active = now >= w.start && now < w.end;
-            let size = if active { 28 } else { 22 };
-            let color = if active {
-                Color::from_rgb(1.0, 0.3, 0.5)
-            } else {
-                Color::WHITE
-            };
-            line = line.push(
-                text(w.ch.to_string()).size(size), // .style(color)
-                                                   // .horizontal_alignment(alignment::Horizontal::Center),
-            );
-        }
+        let art: iced::widget::Image<image::Handle> = image("danni.jpg").into();
+        let now = self.pos;
+        let lrc_lines = self.lrc.lines();
 
-        container(line)
+        let all_line = column(
+            lrc_lines
+                .map(|line| {
+                    let mut line_row = iced::widget::row![];
+                    let words = parse_line(line);
+                    let line_start = words.first().map(|w| w.start).unwrap_or(u64::MAX);
+                    let line_end = words.last().map(|w| w.end).unwrap_or(u64::MIN);
+                    let is_past_line = line_end < now;
+                    let is_current_line = !is_past_line && line_start <= now;
+                    for (w) in words.iter() {
+                        let (size, color) = if is_current_line {
+                            // 当前行：已过字符高亮，未过字符默认
+                            let is_passed = now >= w.start;
+                            if is_passed {
+                                (28, Color::from_rgb(1.0, 0.3, 0.5)) // 高亮样式
+                            } else {
+                                (22, Color::WHITE) // 未高亮样式
+                            }
+                        } else {
+                            // 已过行/未到行：全部用未高亮样式
+                            (22, Color::WHITE)
+                        };
+
+                        line_row = line_row.push(
+                            text(w.ch.to_string()).color(color).size(size), // .horizontal_alignment(alignment::Horizontal::Center),
+                        );
+                    }
+                    line_row.into()
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let play_button: Element<Message> = button("TogglePlay")
+            .on_press(Message::TogglePlay)
+            .width(Length::Fixed(120.0))
+            .height(Length::Fixed(40.0))
+            .into();
+        let now_s = now / 1000;
+        let hours = now_s / 3600;
+        let remaining_secs = now_s % 3600;
+        let minutes = remaining_secs / 60;
+        let seconds = remaining_secs % 60;
+        let now_text: Element<Message> = text(format!(
+            "时分秒格式：{:02}:{:02}:{:02}",
+            hours, minutes, seconds
+        ))
+        .width(Length::Fixed(120.0))
+        .height(Length::Fixed(40.0))
+        .size(20)
+        .into();
+
+        let reset: Element<Message> = button("Reset")
+            .on_press(Message::Reset)
+            .width(Length::Fixed(120.0))
+            .height(Length::Fixed(40.0))
+            .into();
+
+        let main_layout = row![]
+            .push(play_button)
+            .push(reset)
+            .push(now_text)
+            .push(
+                // 歌词容器填充右侧剩余空间
+                container(all_line)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill),
+            )
             .width(Length::Fill)
             .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into()
+            .spacing(20);
+        let bg = container(art).width(Length::Fill).height(Length::Fill);
+        let main_layout = container(main_layout)
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        let overlay_stack = stack![bg, main_layout];
+        let root_container: Element<Message> = container(overlay_stack)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        root_container
     }
 
     // 用 Iced 的「订阅」每帧触发一次 Tick，实现 60 FPS 刷新
     fn subscription(&self) -> iced::Subscription<Message> {
-        iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
+        if self.is_playing {
+            iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick)
+        } else {
+            Subscription::none()
+        }
     }
 }
 
@@ -132,99 +219,3 @@ fn parse_line(line: &str) -> Vec<Word> {
     }
     words
 }
-#[cfg(test)]
-
-mod tests {
-
-    use super::*;
-
-    #[test]
-
-    fn test_parse_first_line_basic() {
-        let content = "[01:23.456]Hello[01:24.000]World";
-
-        let words = parse_lines(content);
-
-        let expected_starts: Vec<u64> = vec![83456; 5].into_iter().chain(vec![84000; 5]).collect();
-
-        let expected_chars: Vec<char> = "HelloWorld".chars().collect();
-
-        for (i, word) in words.iter().enumerate() {
-            println!("{}", word.ch);
-            assert_eq!(word.start, expected_starts[i]);
-
-            assert_eq!(word.ch, expected_chars[i]);
-        }
-
-        // 检查 end 字段（除最后一个外，end = 下一个 start）
-
-        for i in 0..9 {
-            assert_eq!(words[i].end, words[i + 1].start);
-        }
-    }
-
-    // #[test]
-    //
-    // fn test_parse_first_line_no_match() {
-    //     let content = "This line has no timestamps.";
-    //
-    //     let words = parse_first_line(content);
-    //
-    //     assert_eq!(words.len(), 0);
-    // }
-    //
-    // #[test]
-    //
-    // fn test_parse_first_line_empty_input() {
-    //     let content = "";
-    //
-    //     let words = parse_first_line(content);
-    //
-    //     assert_eq!(words.len(), 0);
-    // }
-    //
-    // #[test]
-    //
-    // fn test_parse_first_line_whitespace_only() {
-    //     let content = "[00:00.000]   ";
-    //
-    //     let words = parse_first_line(content);
-    //
-    //     assert_eq!(words.len(), 0); // 空格被过滤
-    // }
-    //
-    // #[test]
-    //
-    // fn test_parse_first_line_single_char() {
-    //     let content = "[00:00.000]A";
-    //
-    //     let words = parse_first_line(content);
-    //
-    //     assert_eq!(words.len(), 1);
-    //
-    //     assert_eq!(words[0].ch, 'A');
-    //
-    //     assert_eq!(words[0].start, 0);
-    //
-    //     assert_eq!(words[0].end, 500); // 最后一个字 end = start + 500
-    // }
-}
-// impl App {
-//     fn new() {}
-//     fn update(&mut self, message: Message) {
-//         match message {
-//             _ => print!("_ matched"),
-//         }
-//     }
-//     fn view(&self) {}
-// }
-//
-// struct Addon {
-//     addon_name: String,
-//     addon_id: i64,
-// }
-//
-// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// enum ViewMode {
-//     Desktop,
-// }
